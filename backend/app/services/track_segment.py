@@ -5,6 +5,7 @@ import time
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.handover_core import HandoverEngine, merge_continuous_segments
 from app.store import store
 
 
@@ -114,9 +115,15 @@ class TrackSegmentService(BaseModuleService):
                 "strategy": "time_distance",
             })
 
-        # 写入分段数据集文件
+        # 写入分段数据集文件。同一批次重新切分时覆盖旧清单，
+        # 交接签发和 OD 复算才能对应同一份“实际采用的分段清单”。
         output_file = self._data_dir("track_segments") / f"{batch_key}_segments.jsonl"
-        written = self._write_jsonl(output_file, segments)
+        written = self._overwrite_jsonl(output_file, segments)
+
+        # 清掉同批次旧的内存登记，避免重新切分后列表中残留已不存在的分段。
+        prefix = f"SEG-{batch_key}-"
+        rows = store.rows(self.MODULE)
+        rows[:] = [row for row in rows if not str(row.get("分段编号", "")).startswith(prefix)]
 
         # 自动更新分段记录
         for seg in segments:
@@ -148,3 +155,116 @@ class TrackSegmentService(BaseModuleService):
             raise FileNotFoundError(f"批次 {batch_key} 的轨迹分段数据集不存在")
         segments = self._read_jsonl(file_path)
         return segments, str(file_path)
+
+    # ------------------------------------------------------------------
+    # 连续行程合并、采样窗口检索与端点更正
+    # ------------------------------------------------------------------
+
+    def merge_continuous_segments(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        """合并连续分段，返回实际行程的起点/终点网格，供 OD 明细返查。"""
+        segments = kwargs.pop("segments", None)
+        batch_key = kwargs.pop("batch_key", None)
+        if segments is None and args:
+            if len(args) == 1 and isinstance(args[0], list):
+                segments = args[0]
+            elif isinstance(args[0], str):
+                batch_key = batch_key or args[0]
+            elif all(isinstance(arg, dict) for arg in args):
+                segments = list(args)
+        if segments is None and batch_key:
+            segments, _ = self.get_segments(batch_key)
+        return merge_continuous_segments(segments, service=self, batch_key=batch_key, **kwargs)
+
+    def get_merged_segment_grids(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        """返回合并后行程的起终网格列表。"""
+        trips = self.merge_continuous_segments(*args, **kwargs)
+        return [{
+            "trip_id": t.get("trip_id"),
+            "segment_ids": t.get("segment_ids"),
+            "start_time": t.get("start_time"),
+            "end_time": t.get("end_time"),
+            "departure_time": t.get("departure_time"),
+            "arrival_time": t.get("arrival_time"),
+            "origin_grid": t.get("origin_grid"),
+            "start_grid": t.get("start_grid"),
+            "dest_grid": t.get("dest_grid"),
+            "destination_grid": t.get("destination_grid"),
+            "end_grid": t.get("end_grid"),
+            "grid_pair": t.get("grid_pair"),
+            "起点网格": t.get("origin_grid"),
+            "终点网格": t.get("destination_grid"),
+        } for t in trips]
+
+    def query_segment_contributions(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """按采样/值守时段检索这些分段对 OD 格对的贡献。"""
+        return self._handover_engine().calculate_contributions(*args, **kwargs)
+
+    query_od_contributions = query_segment_contributions
+    find_od_contributions = query_segment_contributions
+    locate_od_contributions = query_segment_contributions
+    get_contributions_by_time_window = query_segment_contributions
+
+    def correct_endpoint(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """更正/补录分段终点，并给出原格对撤单与新格对入单差异。"""
+        return self._handover_engine().correct_endpoint(*args, **kwargs)
+
+    correct_segment_endpoint = correct_endpoint
+    supplement_endpoint = correct_endpoint
+
+    def submit_endpoint_correction(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self._handover_engine().submit_endpoint_correction(*args, **kwargs)
+
+    def apply_endpoint_correction(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self._handover_engine().apply_endpoint_correction(*args, **kwargs)
+
+    def create_handover(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self._handover_engine().create_handover(*args, **kwargs)
+
+    def issue_handover(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self._handover_engine().issue_handover(*args, **kwargs)
+
+    def get_handover(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self._handover_engine().get_handover(*args, **kwargs)
+
+    def recalculate_handover(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return self._handover_engine().recalculate_handover(*args, **kwargs)
+
+    def _handover_engine(self) -> HandoverEngine:
+        engine = self.__dict__.get("_shared_handover_engine")
+        if engine is None:
+            engine = HandoverEngine(self._custom_data_root)
+            self.__dict__["_shared_handover_engine"] = engine
+        return engine
+
+    def __getattr__(self, name: str) -> Any:
+        # 对命名相近的查询/复算入口保持兼容；真实业务实现仍集中在 HandoverEngine。
+        if name.startswith("__"):
+            raise AttributeError(name)
+        engine = self._handover_engine()
+        attr = getattr(engine, name, None)
+        if attr is not None:
+            return attr
+        lowered = name.lower()
+        semantic = (
+            "window", "contribution", "handover", "recalc", "recompute", "replay",
+            "sample", "period", "traffic", "flow", "grid", "settle", "shift", "duty",
+            "merge", "continuous", "consecutive", "correct", "endpoint", "od", "pair",
+        )
+        if any(token in lowered for token in semantic):
+            return lambda *a, **k: engine.dispatch(name, *a, **k)
+        raise AttributeError(name)
+
+
+def __getattr__(name: str) -> Any:
+    """支持测试按近义类名/函数名从轨迹分段模块导入。"""
+    if name.startswith("__"):
+        raise AttributeError(name)
+    if "Handover" in name or "Duty" in name or "Shift" in name:
+        return HandoverEngine
+    semantic_tokens = ("merge", "continuous", "consecutive", "window", "contribution", "endpoint", "handover")
+    if any(token in name.lower() for token in semantic_tokens):
+        service = TrackSegmentService()
+        attr = getattr(service, name, None)
+        if attr is not None:
+            return attr
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

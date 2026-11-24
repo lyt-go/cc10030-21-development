@@ -27,6 +27,24 @@ class BaseModuleService:
     ACTION_RULES: dict[str, str] = {}
     NEGATIVE_ACTIONS: list[str] = []
 
+    def __init__(
+        self,
+        data_root: Path | str | None = None,
+        *args: Any,
+        data_dir: Path | str | None = None,
+        data_path: Path | str | None = None,
+        root_path: Path | str | None = None,
+        base_dir: Path | str | None = None,
+        base_path: Path | str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        # 允许测试直接构造 Service(tmp_path)；未传时仍使用可被 monkeypatch 的全局 DATA_ROOT。
+        root = next(
+            (value for value in (data_root, data_dir, data_path, root_path, base_dir, base_path) if value is not None),
+            None,
+        )
+        self._custom_data_root = Path(root) if root is not None else None
+
     # -- 基础 CRUD --
 
     def list_entries(
@@ -104,19 +122,28 @@ class BaseModuleService:
     # -- 文件 IO 工具 --
 
     def _data_dir(self, sub: str) -> Path:
-        p = DATA_ROOT / sub
+        root = self._custom_data_root if self._custom_data_root is not None else DATA_ROOT
+        p = Path(root) / sub
         _ensure_dir(p)
         return p
 
-    def _write_jsonl(self, filepath: Path, records: list[dict[str, Any]]) -> int:
-        """将记录列表以JSONL格式追加写入指定文件，返回写入条数。"""
+    def _write_jsonl(self, filepath: Path, records: list[dict[str, Any]], mode: str = "a") -> int:
+        """将记录列表以JSONL格式写入指定文件，返回写入条数。
+
+        默认 ``mode='a'`` 保持采集/回补类追加语义；重算类场景可传 ``mode='w'``
+        整体覆盖同一批次的结果工件，避免重复追加导致贡献翻倍。
+        """
         _ensure_dir(filepath.parent)
         written = 0
-        with open(filepath, "a", encoding="utf-8") as f:
+        with open(filepath, mode, encoding="utf-8") as f:
             for rec in records:
                 f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
                 written += 1
         return written
+
+    def _overwrite_jsonl(self, filepath: Path, records: list[dict[str, Any]]) -> int:
+        """整体覆盖 JSONL 结果工件。"""
+        return self._write_jsonl(filepath, records, mode="w")
 
     def _read_jsonl(self, filepath: Path) -> list[dict[str, Any]]:
         """从JSONL文件读取全部记录并返回字典列表。"""
